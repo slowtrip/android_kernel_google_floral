@@ -9083,8 +9083,6 @@ enum group_type {
 #define LBF_NEED_BREAK	0x02
 #define LBF_DST_PINNED  0x04
 #define LBF_SOME_PINNED	0x08
-#define LBF_IGNORE_BIG_TASKS 0x100
-#define LBF_IGNORE_PREFERRED_CLUSTER_TASKS 0x200
 
 struct lb_env {
 	struct sched_domain	*sd;
@@ -10082,16 +10080,7 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
 		struct rq *rq = cpu_rq(i);
 
-		if (cpu_isolated(i))
-			continue;
-
-		/* Bias balancing toward cpus of our domain */
-		if (local_group)
-			load = target_load(i, load_idx);
-		else
-			load = source_load(i, load_idx);
-
-		sgs->group_load += load;
+		sgs->group_load += cpu_load(rq);
 		sgs->group_util += cpu_util(i);
 		sgs->sum_nr_running += rq->cfs.h_nr_running;
 
@@ -10302,32 +10291,6 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
 	bool overload = false, overutilized = false, misfit_task = false;
 	bool prefer_sibling = child && child->flags & SD_PREFER_SIBLING;
 
-#ifdef CONFIG_NO_HZ_COMMON
-	if (env->idle == CPU_NEWLY_IDLE) {
-		int cpu;
-
-		/* Update the stats of NOHZ idle CPUs in the sd */
-		for_each_cpu_and(cpu, sched_domain_span(env->sd),
-				 nohz.idle_cpus_mask) {
-			struct rq *rq = cpu_rq(cpu);
-
-			/* ... Unless we've already done since the last tick */
-			if (time_after(jiffies,
-                                       rq->last_blocked_load_update_tick))
-				update_blocked_averages(cpu);
-		}
-	}
-	/*
-	 * If we've just updated all of the NOHZ idle CPUs, then we can push
-	 * back the next nohz.next_update, which will prevent an unnecessary
-	 * wakeup for the nohz stats kick
-	 */
-	if (cpumask_subset(nohz.idle_cpus_mask, sched_domain_span(env->sd)))
-		nohz.next_update = jiffies + LOAD_AVG_PERIOD;
-#endif
-
-	load_idx = get_sd_load_idx(env->sd, env->idle);
-
 	do {
 		struct sg_lb_stats *sgs = &tmp_sgs;
 		int local_group;
@@ -10385,6 +10348,10 @@ next_group:
 
 		sg = sg->next;
 	} while (sg != env->sd->groups);
+
+	/* Tag domain that child domain prefers tasks go to siblings first */
+	sds->prefer_sibling = child && child->flags & SD_PREFER_SIBLING;
+
 
 	if (env->sd->flags & SD_NUMA)
 		env->fbq_type = fbq_classify_group(&sds->busiest_stat);
@@ -12107,8 +12074,72 @@ end:
  */
 static inline bool nohz_kick_needed(struct rq *rq, bool only_update)
 {
-	unsigned long now = jiffies;
-	struct sched_domain_shared *sds;
+	unsigned int flags = this_rq->nohz_idle_balance;
+
+	if (!flags)
+		return false;
+
+	this_rq->nohz_idle_balance = 0;
+
+	if (idle != CPU_IDLE)
+		return false;
+
+	_nohz_idle_balance(this_rq, flags, idle);
+
+	return true;
+}
+
+static void nohz_newidle_balance(struct rq *this_rq)
+{
+	int this_cpu = this_rq->cpu;
+
+	/*
+	 * This CPU doesn't want to be disturbed by scheduler
+	 * housekeeping
+	 */
+	if (!housekeeping_cpu(this_cpu, HK_FLAG_SCHED))
+		return;
+
+	/* Will wake up very soon. No time for doing anything else*/
+	if (this_rq->avg_idle < sysctl_sched_migration_cost)
+		return;
+
+	/* Don't need to update blocked load of idle CPUs*/
+	if (!READ_ONCE(nohz.has_blocked) ||
+	    time_before(jiffies, READ_ONCE(nohz.next_blocked)))
+		return;
+
+	/*
+	 * Blocked load of idle CPUs need to be updated.
+	 * Kick an ILB to update statistics.
+	 */
+	kick_ilb(NOHZ_STATS_KICK);
+}
+
+#else /* !CONFIG_NO_HZ_COMMON */
+static inline void nohz_balancer_kick(struct rq *rq) { }
+
+static inline bool nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle)
+{
+	return false;
+}
+
+static inline void nohz_newidle_balance(struct rq *this_rq) { }
+#endif /* CONFIG_NO_HZ_COMMON */
+
+/*
+ * idle_balance is called by schedule() if this_cpu is about to become
+ * idle. Attempts to pull tasks from other CPUs.
+ *
+ * Returns:
+ *   < 0 - we released the lock and there are !fair tasks present
+ *     0 - failed, no new tasks
+ *   > 0 - success, new (fair) tasks present
+ */
+static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
+{
+	unsigned long next_balance = jiffies + HZ;
+	int this_cpu = this_rq->cpu;
 	struct sched_domain *sd;
 	int nr_busy, i, cpu = rq->cpu;
 	bool kick = false;
@@ -12132,11 +12163,24 @@ static inline bool nohz_kick_needed(struct rq *rq, bool only_update)
 	if (cpumask_empty(&cpumask))
 		return false;
 
-	if (only_update) {
-		if (time_before(now, nohz.next_update))
-			return false;
-		else
-			return true;
+	/*
+	 * This is OK, because current is on_cpu, which avoids it being picked
+	 * for load-balance and preemption/IRQs are still disabled avoiding
+	 * further scheduler activity on it and we're being very careful to
+	 * re-start the picking loop.
+	 */
+	rq_unpin_lock(this_rq, rf);
+
+	if (this_rq->avg_idle < sysctl_sched_migration_cost ||
+	    !READ_ONCE(this_rq->rd->overload)) {
+
+		rcu_read_lock();
+		sd = rcu_dereference_check_sched_domain(this_rq->sd);
+		if (sd)
+			update_next_balance(sd, &next_balance);
+		rcu_read_unlock();
+
+		goto out;
 	}
 
 	if (time_before(now, nohz.next_balance))
@@ -12192,7 +12236,37 @@ static inline bool nohz_kick_needed(struct rq *rq, bool only_update)
 	}
 unlock:
 	rcu_read_unlock();
-	return kick;
+
+	raw_spin_lock(&this_rq->lock);
+
+	if (curr_cost > this_rq->max_idle_balance_cost)
+		this_rq->max_idle_balance_cost = curr_cost;
+
+out:
+	/*
+	 * While browsing the domains, we released the rq lock, a task could
+	 * have been enqueued in the meantime. Since we're not going idle,
+	 * pretend we pulled a task.
+	 */
+	if (this_rq->cfs.h_nr_running && !pulled_task)
+		pulled_task = 1;
+
+	/* Move the next balance forward */
+	if (time_after(this_rq->next_balance, next_balance))
+		this_rq->next_balance = next_balance;
+
+	/* Is there a task of a high priority class? */
+	if (this_rq->nr_running != this_rq->cfs.h_nr_running)
+		pulled_task = -1;
+
+	if (pulled_task)
+		this_rq->idle_stamp = 0;
+	else
+		nohz_newidle_balance(this_rq);
+
+	rq_repin_lock(this_rq, rf);
+
+	return pulled_task;
 }
 #else
 static void nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle) { }
