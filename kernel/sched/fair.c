@@ -12166,12 +12166,20 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 	if (unlikely(rq->idle_balance) && !only_update)
 		return false;
 
-       /*
-	* We may be recently in ticked or tickless idle mode. At the first
-	* busy tick after returning from idle, we will update the busy stats.
-	*/
-	set_cpu_sd_state_busy();
-	nohz_balance_exit_idle(cpu);
+	update_misfit_status(NULL, this_rq);
+
+	/*
+	 * There is a task waiting to run. No need to search for one.
+	 * Return 0; the task will be enqueued when switching to idle.
+	 */
+	if (this_rq->ttwu_pending)
+		return 0;
+
+	/*
+	 * We must set idle_stamp _before_ calling idle_balance(), such that we
+	 * measure the duration of idle_balance() as idle time.
+	 */
+	this_rq->idle_stamp = rq_clock(this_rq);
 
 	/*
 	 * None are in tickless mode and hence no need for NOHZ idle load
@@ -12222,12 +12230,9 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 		 * XXX: write a coherent comment on why we do this.
 		 * See also: http://lkml.kernel.org/r/20111202010832.602203411@sbsiddha-desk.sc.intel.com
 		 */
-		nr_busy = atomic_read(&sds->nr_busy_cpus);
-		if (nr_busy > 1) {
-			kick = true;
-			goto unlock;
-		}
-
+		if (pulled_task || this_rq->nr_running > 0 ||
+		    this_rq->ttwu_pending)
+			break;
 	}
 
 	sd = rcu_dereference(rq->sd);
