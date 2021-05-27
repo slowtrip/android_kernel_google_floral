@@ -3398,9 +3398,27 @@ update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	se->avg.load_avg = load;
 	se->avg.load_sum = se->avg.load_avg * LOAD_AVG_MAX;
 
-	/* Update parent cfs_rq load */
-	add_positive(&cfs_rq->avg.load_avg, delta);
-	cfs_rq->avg.load_sum = cfs_rq->avg.load_avg * LOAD_AVG_MAX;
+	/* Set new sched_entity's runnable */
+	se->avg.runnable_avg = gcfs_rq->avg.runnable_avg;
+	se->avg.runnable_sum = se->avg.runnable_avg * divider;
+
+	/* Update parent cfs_rq runnable */
+	add_positive(&cfs_rq->avg.runnable_avg, delta);
+	cfs_rq->avg.runnable_sum = cfs_rq->avg.runnable_avg * divider;
+}
+
+static inline void
+update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq *gcfs_rq)
+{
+	long delta, running_sum, runnable_sum = gcfs_rq->prop_runnable_sum;
+	unsigned long load_avg;
+	u64 load_sum = 0;
+	u32 divider;
+
+	if (!runnable_sum)
+		return;
+
+	gcfs_rq->prop_runnable_sum = 0;
 
 	/*
 	 * If the sched_entity is already enqueued, we also have to update the
@@ -3411,6 +3429,26 @@ update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se)
 		add_positive(&cfs_rq->runnable_load_avg, delta);
 		cfs_rq->runnable_load_sum = cfs_rq->runnable_load_avg * LOAD_AVG_MAX;
 	}
+
+	/*
+	 * runnable_sum can't be lower than running_sum
+	 * Rescale running sum to be in the same range as runnable sum
+	 * running_sum is in [0 : LOAD_AVG_MAX <<  SCHED_CAPACITY_SHIFT]
+	 * runnable_sum is in [0 : LOAD_AVG_MAX]
+	 */
+	running_sum = se->avg.util_sum >> SCHED_CAPACITY_SHIFT;
+	runnable_sum = max(runnable_sum, running_sum);
+
+	load_sum = (s64)se_weight(se) * runnable_sum;
+	load_avg = div_s64(load_sum, divider);
+
+	delta = load_avg - se->avg.load_avg;
+
+	se->avg.load_sum = runnable_sum;
+	se->avg.load_avg = load_avg;
+
+	add_positive(&cfs_rq->avg.load_avg, delta);
+	cfs_rq->avg.load_sum = cfs_rq->avg.load_avg * divider;
 }
 
 static inline void set_tg_cfs_propagate(struct cfs_rq *cfs_rq)
