@@ -893,8 +893,12 @@ static int geni_i2c_xfer(struct i2c_adapter *adap,
 
 		ret = gi2c->err;
 		if (gi2c->err) {
+<<<<<<< HEAD
 			GENI_SE_ERR(gi2c->ipcl, true, gi2c->dev,
 				"i2c error :%d\n", gi2c->err);
+=======
+			dev_dbg(gi2c->dev, "i2c error :%d\n", gi2c->err);
+>>>>>>> 126d0a5e274f (treewide: Silence verbose logging)
 			break;
 		}
 	}
