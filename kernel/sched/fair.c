@@ -12522,10 +12522,10 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 {
 	unsigned long next_balance = jiffies + HZ;
 	int this_cpu = this_rq->cpu;
+	u64 t0, t1, curr_cost = 0;
 	struct sched_domain *sd;
-	int nr_busy, i, cpu = rq->cpu;
-	bool kick = false;
-	cpumask_t cpumask;
+	int pulled_task = 0;
+	int done = 0;
 
 	if (unlikely(rq->idle_balance) && !only_update)
 		return false;
@@ -12587,9 +12587,36 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 	if (energy_aware())
 		return rq->misfit_task_load > 0;
 
+	t0 = sched_clock_cpu(this_cpu);
+	update_blocked_averages(this_cpu);
+
 	rcu_read_lock();
-	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
-	if (sds && !energy_aware()) {
+	for_each_domain(this_cpu, sd) {
+		int continue_balancing = 1;
+		u64 domain_cost;
+
+		if (this_rq->avg_idle < curr_cost + sd->max_newidle_lb_cost) {
+			update_next_balance(sd, &next_balance);
+			break;
+		}
+
+		if (sd->flags & SD_BALANCE_NEWIDLE) {
+
+			pulled_task = load_balance(this_cpu, this_rq,
+						   sd, CPU_NEWLY_IDLE,
+						   &continue_balancing);
+
+			t1 = sched_clock_cpu(this_cpu);
+			domain_cost = t1 - t0;
+			if (domain_cost > sd->max_newidle_lb_cost)
+				sd->max_newidle_lb_cost = domain_cost;
+
+			curr_cost += domain_cost;
+			t0 = t1;
+		}
+
+		update_next_balance(sd, &next_balance);
+
 		/*
 		 * XXX: write a coherent comment on why we do this.
 		 * See also: http://lkml.kernel.org/r/20111202010832.602203411@sbsiddha-desk.sc.intel.com
