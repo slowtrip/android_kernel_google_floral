@@ -3671,44 +3671,11 @@ update_tg_cfs_util(struct cfs_rq *cfs_rq, struct sched_entity *se)
 static inline void
 update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	struct cfs_rq *gcfs_rq = group_cfs_rq(se);
-	long delta, load = gcfs_rq->avg.load_avg;
-
-	/*
-	 * If the load of group cfs_rq is null, the load of the
-	 * sched_entity will also be null so we can skip the formula
-	 */
-	if (load) {
-		long tg_load;
-
-		/* Get tg's load and ensure tg_load > 0 */
-		tg_load = atomic_long_read(&gcfs_rq->tg->load_avg) + 1;
-
-		/* Ensure tg_load >= load and updated with current load*/
-		tg_load -= gcfs_rq->tg_load_avg_contrib;
-		tg_load += load;
-
-		/*
-		 * We need to compute a correction term in the case that the
-		 * task group is consuming more CPU than a task of equal
-		 * weight. A task with a weight equals to tg->shares will have
-		 * a load less or equal to scale_load_down(tg->shares).
-		 * Similarly, the sched_entities that represent the task group
-		 * at parent level, can't have a load higher than
-		 * scale_load_down(tg->shares). And the Sum of sched_entities'
-		 * load must be <= scale_load_down(tg->shares).
-		 */
-		if (tg_load > scale_load_down(gcfs_rq->tg->shares)) {
-			/* scale gcfs_rq's load into tg's shares*/
-			load *= scale_load_down(gcfs_rq->tg->shares);
-			load /= tg_load;
-		}
-	}
-
-	delta = load - se->avg.load_avg;
+	long delta_sum, delta_avg = gcfs_rq->avg.runnable_avg - se->avg.runnable_avg;
+	u32 new_sum, divider;
 
 	/* Nothing to update */
-	if (!delta)
+	if (!delta_avg)
 		return;
 
 	/* Set new sched_entity's load */
@@ -3717,11 +3684,16 @@ update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 	/* Set new sched_entity's runnable */
 	se->avg.runnable_avg = gcfs_rq->avg.runnable_avg;
-	se->avg.runnable_sum = se->avg.runnable_avg * divider;
+	new_sum = se->avg.runnable_avg * divider;
+	delta_sum = (long)new_sum - (long)se->avg.runnable_sum;
+	se->avg.runnable_sum = new_sum;
 
 	/* Update parent cfs_rq runnable */
-	add_positive(&cfs_rq->avg.runnable_avg, delta);
-	cfs_rq->avg.runnable_sum = cfs_rq->avg.runnable_avg * divider;
+	add_positive(&cfs_rq->avg.runnable_avg, delta_avg);
+	add_positive(&cfs_rq->avg.runnable_sum, delta_sum);
+	/* See update_cfs_rq_load_avg() */
+	cfs_rq->avg.runnable_sum = max_t(u32, cfs_rq->avg.runnable_sum,
+					      cfs_rq->avg.runnable_avg * PELT_MIN_DIVIDER);
 }
 
 static inline void
@@ -3896,9 +3868,39 @@ update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
 	if (atomic_long_read(&cfs_rq->removed_load_avg)) {
 		s64 r = atomic_long_xchg(&cfs_rq->removed_load_avg, 0);
 		sub_positive(&sa->load_avg, r);
-		sub_positive(&sa->load_sum, r * LOAD_AVG_MAX);
-		removed_load = 1;
-		set_tg_cfs_propagate(cfs_rq);
+		sub_positive(&sa->load_sum, r * divider);
+
+		r = removed_util;
+		sub_positive(&sa->util_avg, r);
+		sub_positive(&sa->util_sum, r * divider);
+		/*
+		 * Because of rounding, se->util_sum might ends up being +1 more than
+		 * cfs->util_sum. Although this is not a problem by itself, detaching
+		 * a lot of tasks with the rounding problem between 2 updates of
+		 * util_avg (~1ms) can make cfs->util_sum becoming null whereas
+		 * cfs_util_avg is not.
+		 * Check that util_sum is still above its lower bound for the new
+		 * util_avg. Given that period_contrib might have moved since the last
+		 * sync, we are only sure that util_sum must be above or equal to
+		 *    util_avg * minimum possible divider
+		 */
+		sa->util_sum = max_t(u32, sa->util_sum, sa->util_avg * PELT_MIN_DIVIDER);
+
+		r = removed_runnable;
+		sub_positive(&sa->runnable_avg, r);
+		sub_positive(&sa->runnable_sum, r * divider);
+		/* See sa->util_sum above */
+		sa->runnable_sum = max_t(u32, sa->runnable_sum,
+					      sa->runnable_avg * PELT_MIN_DIVIDER);
+
+		/*
+		 * removed_runnable is the unweighted version of removed_load so we
+		 * can use it to estimate removed_load_sum.
+		 */
+		add_tg_cfs_propagate(cfs_rq,
+			-(long)(removed_runnable * divider) >> SCHED_CAPACITY_SHIFT);
+
+		decayed = 1;
 	}
 
 	if (atomic_long_read(&cfs_rq->removed_util_avg)) {
@@ -3992,12 +3994,6 @@ static void attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
  */
 static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	/*
-	 * cfs_rq->avg.period_contrib can be used for both cfs_rq and se.
-	 * See ___update_load_avg() for details.
-	 */
-	u32 divider = get_pelt_divider(&cfs_rq->avg);
-
 	trace_android_rvh_detach_entity_load_avg(cfs_rq, se);
 
 	sub_positive(&cfs_rq->avg.load_avg, se->avg.load_avg);
@@ -4009,7 +4005,10 @@ static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
 					  cfs_rq->avg.util_avg * PELT_MIN_DIVIDER);
 
 	sub_positive(&cfs_rq->avg.runnable_avg, se->avg.runnable_avg);
-	cfs_rq->avg.runnable_sum = cfs_rq->avg.runnable_avg * divider;
+	sub_positive(&cfs_rq->avg.runnable_sum, se->avg.runnable_sum);
+	/* See update_cfs_rq_load_avg() */
+	cfs_rq->avg.runnable_sum = max_t(u32, cfs_rq->avg.runnable_sum,
+					      cfs_rq->avg.runnable_avg * PELT_MIN_DIVIDER);
 
 	cfs_rq_util_change(cfs_rq);
 
