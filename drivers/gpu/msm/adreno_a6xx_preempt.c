@@ -1,4 +1,5 @@
 /* Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -31,26 +32,44 @@ enum {
 	SET_PSEUDO_REGISTER_SAVE_REGISTER_COUNTER,
 };
 
-static void _update_wptr(struct adreno_device *adreno_dev, bool reset_timer,
-			 bool in_irq)
+static void _update_wptr(struct adreno_device *adreno_dev, bool reset_timer)
 {
 	struct adreno_ringbuffer *rb = adreno_dev->cur_rb;
 	unsigned long flags;
-	bool write = false;
-	unsigned int val;
 	int ret = 0;
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 
 	spin_lock_irqsave(&rb->preempt_lock, flags);
 
-	if (!in_irq) {
+	if (in_interrupt() == 0) {
 		/*
 		 * We might have skipped updating the wptr in case we are in
 		 * dispatcher context. Do it now.
 		 */
 		if (rb->skip_inline_wptr) {
-			write = true;
-			val = rb->wptr;
+			/*
+			 * There could be a situation where GPU comes out of
+			 * ifpc after a fenced write transaction but before
+			 * reading AHB_FENCE_STATUS from KMD, it goes back to
+			 * ifpc due to inactivity (kernel scheduler plays a
+			 * role here). Thus, the GPU could technically be
+			 * re-collapsed between subsequent register writes
+			 * leading to a prolonged preemption sequence. The
+			 * keepalive bit prevents any further power collapse
+			 * while it is set.
+			 */
+			if (gmu_core_isenabled(device))
+				gmu_core_regrmw(device, A6XX_GMU_AO_SPARE_CNTL,
+					0x0, 0x2);
+
+			ret = adreno_gmu_fenced_write(adreno_dev,
+				ADRENO_REG_CP_RB_WPTR, rb->wptr,
+				FENCE_STATUS_WRITEDROPPED0_MASK);
+
+			/* Clear the keep alive */
+			if (gmu_core_isenabled(device))
+				gmu_core_regrmw(device, A6XX_GMU_AO_SPARE_CNTL,
+					0x2, 0x0);
 
 			reset_timer = true;
 			rb->skip_inline_wptr = false;
@@ -72,31 +91,7 @@ static void _update_wptr(struct adreno_device *adreno_dev, bool reset_timer,
 
 	spin_unlock_irqrestore(&rb->preempt_lock, flags);
 
-	if (write) {
-		bool gmu_core_enabled = gmu_core_isenabled(device);
-
-		/*
-		 * There could be a situation where GPU comes out of ifpc after
-		 * a fenced write but before reading AHB_FENCE_STATUS from KMD,
-		 * it goes back to ifpc due to inactivity (kernel scheduler
-		 * plays a role here). Thus, the GPU could technically be
-		 * re-collapsed between subsequent register writes leading to a
-		 * prolonged preemption sequence. The keepalive bit prevents any
-		 * further power collapse while it is set.
-		 */
-		if (gmu_core_enabled)
-			gmu_core_regrmw(device, A6XX_GMU_AO_SPARE_CNTL, 0, 2);
-
-		ret = adreno_gmu_fenced_write(adreno_dev, ADRENO_REG_CP_RB_WPTR,
-					      val,
-					      FENCE_STATUS_WRITEDROPPED0_MASK);
-
-		/* Clear the keep alive */
-		if (gmu_core_enabled)
-			gmu_core_regrmw(device, A6XX_GMU_AO_SPARE_CNTL, 2, 0);
-	}
-
-	if (!in_irq) {
+	if (in_interrupt() == 0) {
 		/* If WPTR update fails, set the fault and trigger recovery */
 		if (ret) {
 			adreno_set_gpu_fault(adreno_dev, ADRENO_GMU_FAULT);
@@ -157,7 +152,7 @@ static void _a6xx_preemption_done(struct adreno_device *adreno_dev)
 	adreno_dev->next_rb = NULL;
 
 	/* Update the wptr for the new command queue */
-	_update_wptr(adreno_dev, true, false);
+	_update_wptr(adreno_dev, true);
 
 	/* Update the dispatcher timer for the new command queue */
 	mod_timer(&adreno_dev->dispatcher.timer,
@@ -254,7 +249,7 @@ static struct adreno_ringbuffer *a6xx_next_ringbuffer(
 	return NULL;
 }
 
-void a6xx_preemption_trigger(struct adreno_device *adreno_dev, bool in_irq)
+void a6xx_preemption_trigger(struct adreno_device *adreno_dev)
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	struct kgsl_iommu *iommu = KGSL_IOMMU_PRIV(device);
@@ -288,7 +283,7 @@ void a6xx_preemption_trigger(struct adreno_device *adreno_dev, bool in_irq)
 		 */
 
 		if (next != NULL) {
-			_update_wptr(adreno_dev, false, in_irq);
+			_update_wptr(adreno_dev, false);
 
 			mod_timer(&adreno_dev->dispatcher.timer,
 				adreno_dev->cur_rb->dispatch_q.expires);
@@ -480,7 +475,7 @@ void a6xx_preemption_callback(struct adreno_device *adreno_dev, int bit)
 	adreno_dev->next_rb = NULL;
 
 	/* Update the wptr if it changed while preemption was ongoing */
-	_update_wptr(adreno_dev, true, true);
+	_update_wptr(adreno_dev, true);
 
 	/* Update the dispatcher timer for the new command queue */
 	mod_timer(&adreno_dev->dispatcher.timer,
@@ -488,7 +483,7 @@ void a6xx_preemption_callback(struct adreno_device *adreno_dev, int bit)
 
 	adreno_set_preempt_state(adreno_dev, ADRENO_PREEMPT_NONE);
 
-	a6xx_preemption_trigger(adreno_dev, true);
+	a6xx_preemption_trigger(adreno_dev);
 }
 
 void a6xx_preemption_schedule(struct adreno_device *adreno_dev)
@@ -503,7 +498,7 @@ void a6xx_preemption_schedule(struct adreno_device *adreno_dev)
 	if (adreno_in_preempt_state(adreno_dev, ADRENO_PREEMPT_COMPLETE))
 		_a6xx_preemption_done(adreno_dev);
 
-	a6xx_preemption_trigger(adreno_dev, false);
+	a6xx_preemption_trigger(adreno_dev);
 
 	mutex_unlock(&device->mutex);
 }
@@ -554,13 +549,27 @@ unsigned int a6xx_preemption_pre_ibsubmit(
 	if (context) {
 		struct adreno_context *drawctxt = ADRENO_CONTEXT(context);
 		struct adreno_ringbuffer *rb = drawctxt->rb;
-		uint64_t dest = adreno_dev->preempt.scratch.gpuaddr +
-			sizeof(u64) * rb->id;
+		uint64_t dest = PREEMPT_SCRATCH_ADDR(adreno_dev, rb->id);
 
 		*cmds++ = cp_mem_packet(adreno_dev, CP_MEM_WRITE, 2, 2);
 		cmds += cp_gpuaddr(adreno_dev, cmds, dest);
 		*cmds++ = lower_32_bits(gpuaddr);
 		*cmds++ = upper_32_bits(gpuaddr);
+
+		/*
+		 * Add a KMD post amble to clear the perf counters during
+		 * preemption
+		 */
+		if (!adreno_dev->perfcounter) {
+			u64 kmd_postamble_addr =
+			PREEMPT_SCRATCH_ADDR(adreno_dev, KMD_POSTAMBLE_IDX);
+
+			*cmds++ = cp_type7_packet(CP_SET_AMBLE, 3);
+			*cmds++ = lower_32_bits(kmd_postamble_addr);
+			*cmds++ = upper_32_bits(kmd_postamble_addr);
+			*cmds++ = ((CP_KMD_AMBLE_TYPE << 20) | GENMASK(22, 20))
+			| (adreno_dev->preempt.postamble_len | GENMASK(19, 0));
+		}
 	}
 
 	return (unsigned int) (cmds - cmds_orig);
@@ -573,8 +582,7 @@ unsigned int a6xx_preemption_post_ibsubmit(struct adreno_device *adreno_dev,
 	struct adreno_ringbuffer *rb = adreno_dev->cur_rb;
 
 	if (rb) {
-		uint64_t dest = adreno_dev->preempt.scratch.gpuaddr +
-			sizeof(u64) * rb->id;
+		uint64_t dest = PREEMPT_SCRATCH_ADDR(adreno_dev, rb->id);
 
 		*cmds++ = cp_mem_packet(adreno_dev, CP_MEM_WRITE, 2, 2);
 		cmds += cp_gpuaddr(adreno_dev, cmds, dest);
@@ -795,6 +803,33 @@ int a6xx_preemption_init(struct adreno_device *adreno_dev)
 			goto err;
 
 		addr += A6XX_CP_CTXRECORD_PREEMPTION_COUNTER_SIZE;
+	}
+
+	/*
+	 * First 8 dwords of the preemption scratch buffer is used to store the
+	 * address for CP to save/restore VPC data. Reserve 11 dwords in the
+	 * preemption scratch buffer from index KMD_POSTAMBLE_IDX for KMD
+	 * postamble pm4 packets
+	 */
+	if (!adreno_dev->perfcounter) {
+		u32 *postamble = preempt->scratch.hostptr +
+					(KMD_POSTAMBLE_IDX * sizeof(u64));
+		u32 count = 0;
+
+		postamble[count++] = cp_type7_packet(CP_REG_RMW, 3);
+		postamble[count++] = A6XX_RBBM_PERFCTR_SRAM_INIT_CMD;
+		postamble[count++] = 0x0;
+		postamble[count++] = 0x1;
+
+		postamble[count++] = cp_type7_packet(CP_WAIT_REG_MEM, 6);
+		postamble[count++] = 0x3;
+		postamble[count++] = A6XX_RBBM_PERFCTR_SRAM_INIT_STATUS;
+		postamble[count++] = 0x0;
+		postamble[count++] = 0x1;
+		postamble[count++] = 0x1;
+		postamble[count++] = 0x0;
+
+		preempt->postamble_len = count;
 	}
 
 	ret = a6xx_preemption_iommu_init(adreno_dev);

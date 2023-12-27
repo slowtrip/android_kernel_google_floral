@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2015-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -184,7 +184,7 @@ struct dsi_ctrl_state_info {
  * @cmd_frame_done:        Completion signal for DSI_CMD_FRAME_DONE interrupt.
  */
 struct dsi_ctrl_interrupts {
-	raw_spinlock_t irq_lock;
+	spinlock_t irq_lock;
 	int irq_num;
 	uint32_t irq_stat_mask;
 	int irq_stat_refcount[DSI_STATUS_INTERRUPT_COUNT];

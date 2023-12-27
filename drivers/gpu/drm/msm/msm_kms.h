@@ -40,8 +40,10 @@
 #define MSM_MODE_FLAG_SEAMLESS_VRR			(1<<3)
 /* Request to switch the bit clk */
 #define MSM_MODE_FLAG_SEAMLESS_DYN_CLK			(1<<4)
+/* Request to switch the panel mode */
+#define MSM_MODE_FLAG_SEAMLESS_POMS			(1<<5)
 /* Request to switch the connector mode, fps only */
-#define MSM_MODE_FLAG_SEAMLESS_DMS_FPS			(1<<5)
+#define MSM_MODE_FLAG_SEAMLESS_DMS_FPS                  (1<<6)
 
 /* As there are different display controller blocks depending on the
  * snapdragon version, the kms support is split out and the appropriate
@@ -137,12 +139,6 @@ struct msm_kms {
 	struct msm_gem_address_space *aspace;
 };
 
-struct msm_commit {
-	uint32_t crtc_mask;
-	uint32_t plane_mask;
-	struct kthread_work commit_work;
-};
-
 /**
  * Subclass of drm_atomic_state, to allow kms backend to have driver
  * private global state.  The kms backend can do whatever it wants
@@ -151,20 +147,7 @@ struct msm_commit {
  */
 struct msm_kms_state {
 	struct drm_atomic_state base;
-#ifdef CONFIG_DRM_MSM_MDP5
 	void *state;
-#endif
-	struct msm_commit commit;
-	/*
-	 * Everything below `commit` may not be allocated in the struct. The
-	 * `crtcs` member must come right after `commit`, as its placement is
-	 * used to determine if the struct was partially allocated or fully
-	 * allocated.
-	 */
-	struct __drm_crtcs_state crtcs[MAX_CRTCS];
-	struct __drm_connnectors_state connectors[MAX_CONNECTORS];
-	struct __drm_planes_state planes[MAX_PLANES];
-	struct llist_node llist;
 };
 #define to_kms_state(x) container_of(x, struct msm_kms_state, base)
 
@@ -242,6 +225,13 @@ static inline bool msm_is_mode_dynamic_fps(const struct drm_display_mode *mode)
 static inline bool msm_is_mode_seamless_vrr(const struct drm_display_mode *mode)
 {
 	return mode ? (mode->private_flags & MSM_MODE_FLAG_SEAMLESS_VRR)
+		: false;
+}
+
+static inline bool msm_is_mode_seamless_poms(
+		const struct drm_display_mode *mode)
+{
+	return mode ? (mode->private_flags & MSM_MODE_FLAG_SEAMLESS_POMS)
 		: false;
 }
 

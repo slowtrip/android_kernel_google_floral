@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -81,6 +81,7 @@ static const struct of_device_id msm_dsi_of_match[] = {
 	{}
 };
 
+#ifdef CONFIG_DEBUG_FS
 static ssize_t debugfs_state_info_read(struct file *file,
 				       char __user *buff,
 				       size_t count,
@@ -117,6 +118,9 @@ static ssize_t debugfs_state_info_read(struct file *file,
 			dsi_ctrl->clk_freq.byte_clk_rate,
 			dsi_ctrl->clk_freq.pix_clk_rate,
 			dsi_ctrl->clk_freq.esc_clk_rate);
+
+	if (len > count)
+		len = count;
 
 	len = min_t(size_t, len, SZ_4K);
 	if (copy_to_user(buff, buf, len)) {
@@ -173,6 +177,9 @@ static ssize_t debugfs_reg_dump_read(struct file *file,
 		return rc;
 	}
 
+	if (len > count)
+		len = count;
+
 	len = min_t(size_t, len, SZ_4K);
 	if (copy_to_user(buff, buf, len)) {
 		kfree(buf);
@@ -200,6 +207,11 @@ static int dsi_ctrl_debugfs_init(struct dsi_ctrl *dsi_ctrl,
 	int rc = 0;
 	struct dentry *dir, *state_file, *reg_dump;
 	char dbg_name[DSI_DEBUG_NAME_LEN];
+
+	if (!dsi_ctrl || !parent) {
+		pr_err("Invalid params\n");
+		return -EINVAL;
+	}
 
 	dir = debugfs_create_dir(dsi_ctrl->name, parent);
 	if (IS_ERR_OR_NULL(dir)) {
@@ -252,6 +264,17 @@ static int dsi_ctrl_debugfs_deinit(struct dsi_ctrl *dsi_ctrl)
 	debugfs_remove(dsi_ctrl->debugfs_root);
 	return 0;
 }
+#else
+static int dsi_ctrl_debugfs_init(struct dsi_ctrl *dsi_ctrl,
+					struct dentry *parent)
+{
+	return 0;
+}
+static int dsi_ctrl_debugfs_deinit(struct dsi_ctrl *dsi_ctrl)
+{
+	return 0;
+}
+#endif /* CONFIG_DEBUG_FS */
 
 static inline struct msm_gem_address_space*
 dsi_ctrl_get_aspace(struct dsi_ctrl *dsi_ctrl,
@@ -1145,7 +1168,7 @@ static int dsi_message_tx(struct dsi_ctrl *dsi_ctrl,
 		goto error;
 	}
 
-	pr_debug("cmd tx type=%02x cmd=%02x len=%lu last=%d\n", msg->type,
+	pr_debug("cmd tx type=%02x cmd=%02x len=%d last=%d\n", msg->type,
 		 msg->tx_len ? *((u8 *)msg->tx_buf) : 0, msg->tx_len,
 		 (msg->flags & MIPI_DSI_MSG_LASTCOMMAND) != 0);
 
@@ -1832,7 +1855,7 @@ static int dsi_ctrl_dev_probe(struct platform_device *pdev)
 	dsi_ctrl->irq_info.irq_num = -1;
 	dsi_ctrl->irq_info.irq_stat_mask = 0x0;
 
-	raw_spin_lock_init(&dsi_ctrl->irq_info.irq_lock);
+	spin_lock_init(&dsi_ctrl->irq_info.irq_lock);
 
 	rc = dsi_ctrl_dts_parse(dsi_ctrl, pdev->dev.of_node);
 	if (rc) {
@@ -1947,7 +1970,6 @@ static struct platform_driver dsi_ctrl_driver = {
 	},
 };
 
-#if defined(CONFIG_DEBUG_FS)
 
 void dsi_ctrl_debug_dump(u32 *entries, u32 size)
 {
@@ -1969,7 +1991,6 @@ void dsi_ctrl_debug_dump(u32 *entries, u32 size)
 	mutex_unlock(&dsi_ctrl_list_lock);
 }
 
-#endif
 /**
  * dsi_ctrl_get() - get a dsi_ctrl handle from an of_node
  * @of_node:    of_node of the DSI controller.
@@ -2061,7 +2082,12 @@ int dsi_ctrl_drv_init(struct dsi_ctrl *dsi_ctrl, struct dentry *parent)
 		goto error;
 	}
 
-	dsi_ctrl_debugfs_init(dsi_ctrl, parent);
+	rc = dsi_ctrl_debugfs_init(dsi_ctrl, parent);
+	if (rc) {
+		pr_err("[DSI_%d] failed to init debug fs, rc=%d\n",
+		       dsi_ctrl->cell_index, rc);
+		goto error;
+	}
 
 error:
 	mutex_unlock(&dsi_ctrl->ctrl_lock);
@@ -2545,9 +2571,9 @@ static irqreturn_t dsi_ctrl_isr(int irq, void *ptr)
 
 	for (i = 0; status && i < DSI_STATUS_INTERRUPT_COUNT; ++i) {
 		if (status & 0x1) {
-			raw_spin_lock_irqsave(&dsi_ctrl->irq_info.irq_lock, flags);
+			spin_lock_irqsave(&dsi_ctrl->irq_info.irq_lock, flags);
 			cb_info = dsi_ctrl->irq_info.irq_stat_cb[i];
-			raw_spin_unlock_irqrestore(
+			spin_unlock_irqrestore(
 					&dsi_ctrl->irq_info.irq_lock, flags);
 
 			if (cb_info.event_cb)
@@ -2588,8 +2614,7 @@ static int _dsi_ctrl_setup_isr(struct dsi_ctrl *dsi_ctrl)
 		rc = irq_num;
 	} else {
 		rc = devm_request_threaded_irq(&dsi_ctrl->pdev->dev, irq_num,
-				dsi_ctrl_isr, NULL, IRQF_NO_THREAD, "dsi_ctrl",
-				dsi_ctrl);
+				dsi_ctrl_isr, NULL, 0, "dsi_ctrl", dsi_ctrl);
 		if (rc) {
 			pr_err("[DSI_%d] Failed to request IRQ, %d\n",
 					dsi_ctrl->cell_index, rc);
@@ -2629,7 +2654,7 @@ void dsi_ctrl_enable_status_interrupt(struct dsi_ctrl *dsi_ctrl,
 			intr_idx >= DSI_STATUS_INTERRUPT_COUNT)
 		return;
 
-	raw_spin_lock_irqsave(&dsi_ctrl->irq_info.irq_lock, flags);
+	spin_lock_irqsave(&dsi_ctrl->irq_info.irq_lock, flags);
 
 	if (dsi_ctrl->irq_info.irq_stat_refcount[intr_idx] == 0) {
 		/* enable irq on first request */
@@ -2646,7 +2671,7 @@ void dsi_ctrl_enable_status_interrupt(struct dsi_ctrl *dsi_ctrl,
 	if (event_info)
 		dsi_ctrl->irq_info.irq_stat_cb[intr_idx] = *event_info;
 
-	raw_spin_unlock_irqrestore(&dsi_ctrl->irq_info.irq_lock, flags);
+	spin_unlock_irqrestore(&dsi_ctrl->irq_info.irq_lock, flags);
 }
 
 void dsi_ctrl_disable_status_interrupt(struct dsi_ctrl *dsi_ctrl,
@@ -2654,11 +2679,10 @@ void dsi_ctrl_disable_status_interrupt(struct dsi_ctrl *dsi_ctrl,
 {
 	unsigned long flags;
 
-	if (!dsi_ctrl || dsi_ctrl->irq_info.irq_num == -1 ||
-			intr_idx >= DSI_STATUS_INTERRUPT_COUNT)
+	if (!dsi_ctrl || intr_idx >= DSI_STATUS_INTERRUPT_COUNT)
 		return;
 
-	raw_spin_lock_irqsave(&dsi_ctrl->irq_info.irq_lock, flags);
+	spin_lock_irqsave(&dsi_ctrl->irq_info.irq_lock, flags);
 
 	if (dsi_ctrl->irq_info.irq_stat_refcount[intr_idx])
 		if (--(dsi_ctrl->irq_info.irq_stat_refcount[intr_idx]) == 0) {
@@ -2667,11 +2691,12 @@ void dsi_ctrl_disable_status_interrupt(struct dsi_ctrl *dsi_ctrl,
 					dsi_ctrl->irq_info.irq_stat_mask);
 
 			/* don't need irq if no lines are enabled */
-			if (dsi_ctrl->irq_info.irq_stat_mask == 0)
+			if (dsi_ctrl->irq_info.irq_stat_mask == 0 &&
+				dsi_ctrl->irq_info.irq_num != -1)
 				disable_irq_nosync(dsi_ctrl->irq_info.irq_num);
 		}
 
-	raw_spin_unlock_irqrestore(&dsi_ctrl->irq_info.irq_lock, flags);
+	spin_unlock_irqrestore(&dsi_ctrl->irq_info.irq_lock, flags);
 }
 
 int dsi_ctrl_host_timing_update(struct dsi_ctrl *dsi_ctrl)

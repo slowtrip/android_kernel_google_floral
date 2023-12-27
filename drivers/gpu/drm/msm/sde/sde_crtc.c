@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2019 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2021 The Linux Foundation. All rights reserved.
  * Copyright (C) 2013 Red Hat
  * Author: Rob Clark <robdclark@gmail.com>
  *
@@ -900,7 +900,7 @@ static ssize_t measured_fps_show(struct device *device,
 	fps_int = (uint64_t) sde_crtc->fps_info.measured_fps;
 	fps_decimal = do_div(fps_int, 10);
 	return scnprintf(buf, PAGE_SIZE,
-	"fps: %llu.%llu duration:%d frame_count:%llu\n", fps_int, fps_decimal,
+	"fps: %d.%d duration:%d frame_count:%llu\n", fps_int, fps_decimal,
 			sde_crtc->fps_info.fps_periodic_duration, frame_count);
 }
 
@@ -1308,9 +1308,6 @@ static int _sde_crtc_set_crtc_roi(struct drm_crtc *crtc,
 			return -EINVAL;
 		}
 
-		if (!mode_info.roi_caps.enabled)
-			continue;
-
 		sde_conn = to_sde_connector(conn_state->connector);
 		sde_conn_state = to_sde_connector_state(conn_state);
 
@@ -1319,6 +1316,9 @@ static int _sde_crtc_set_crtc_roi(struct drm_crtc *crtc,
 						&sde_conn->property_info,
 						&sde_conn_state->property_state,
 						CONNECTOR_PROP_ROI_V1);
+
+		if (!mode_info.roi_caps.enabled)
+			continue;
 
 		/*
 		 * current driver only supports same connector and crtc size,
@@ -2051,7 +2051,7 @@ static void _sde_crtc_blend_setup_mixer(struct drm_crtc *crtc,
 	struct drm_plane_state *state;
 	struct sde_crtc_state *cstate;
 	struct sde_plane_state *pstate = NULL;
-	struct plane_state pstates[SDE_PSTATES_MAX];
+	struct plane_state *pstates = NULL;
 	struct sde_format *format;
 	struct sde_hw_ctl *ctl;
 	struct sde_hw_mixer *lm;
@@ -2062,7 +2062,6 @@ static void _sde_crtc_blend_setup_mixer(struct drm_crtc *crtc,
 	int zpos_cnt[SDE_STAGE_MAX + 1] = { 0 };
 	int i, rot_id = 0, cnt = 0;
 	bool bg_alpha_enable = false;
-	bool is_video_mode;
 
 	if (!sde_crtc || !crtc->state || !mixer) {
 		SDE_ERROR("invalid sde_crtc or mixer\n");
@@ -2074,13 +2073,15 @@ static void _sde_crtc_blend_setup_mixer(struct drm_crtc *crtc,
 	stage_cfg = &sde_crtc->stage_cfg;
 	cstate = to_sde_crtc_state(crtc->state);
 
-	is_video_mode = sde_encoder_check_mode(sde_crtc->mixers[0].encoder,
-					       MSM_DISPLAY_CAP_VID_MODE);
-	if (is_video_mode)
-		cstate->sbuf_prefill_line = _sde_crtc_calc_inline_prefill(crtc);
+	cstate->sbuf_prefill_line = _sde_crtc_calc_inline_prefill(crtc);
 	sde_crtc->sbuf_rot_id_old = sde_crtc->sbuf_rot_id;
 	sde_crtc->sbuf_rot_id = 0x0;
 	sde_crtc->sbuf_rot_id_delta = 0x0;
+
+	pstates = kcalloc(SDE_PSTATES_MAX,
+			sizeof(struct plane_state), GFP_KERNEL);
+	if (!pstates)
+		return;
 
 	drm_atomic_crtc_for_each_plane(plane, crtc) {
 		state = plane->state;
@@ -2096,11 +2097,9 @@ static void _sde_crtc_blend_setup_mixer(struct drm_crtc *crtc,
 		fb = state->fb;
 
 		/* assume all rotated planes report the same prefill amount */
-		if (is_video_mode) {
-			prefill = sde_plane_rot_get_prefill(plane);
-			if (prefill)
-				cstate->sbuf_prefill_line = prefill;
-		}
+		prefill = sde_plane_rot_get_prefill(plane);
+		if (prefill)
+			cstate->sbuf_prefill_line = prefill;
 
 		sde_plane_ctl_flush(plane, ctl, true);
 		rot_id = sde_plane_get_sbuf_id(plane);
@@ -2123,7 +2122,7 @@ static void _sde_crtc_blend_setup_mixer(struct drm_crtc *crtc,
 		format = to_sde_format(msm_framebuffer_format(pstate->base.fb));
 		if (!format) {
 			SDE_ERROR("invalid format\n");
-			return;
+			goto end;
 		}
 
 		if (pstate->stage == SDE_STAGE_BASE && format->alpha_enable)
@@ -2185,6 +2184,9 @@ static void _sde_crtc_blend_setup_mixer(struct drm_crtc *crtc,
 	}
 
 	_sde_crtc_program_lm_output_roi(crtc);
+
+end:
+	kfree(pstates);
 }
 
 static void _sde_crtc_swap_mixers_for_right_partial_update(
@@ -2476,8 +2478,8 @@ int sde_crtc_get_secure_transition_ops(struct drm_crtc *crtc,
 		if (encoder->crtc != crtc)
 			continue;
 
-		post_commit |= sde_encoder_check_mode(encoder,
-						MSM_DISPLAY_CAP_VID_MODE);
+		post_commit |= sde_encoder_check_curr_mode(encoder,
+						MSM_DISPLAY_VIDEO_MODE);
 	}
 
 	SDE_DEBUG("crtc%d: secure_level %d old_valid_fb %d post_commit %d\n",
@@ -3034,7 +3036,8 @@ static void sde_crtc_vblank_cb(void *data)
 		sde_crtc->vblank_cb_count++;
 
 	sde_crtc->vblank_last_cb_time = ktime_get();
-	sysfs_notify_dirent(sde_crtc->vsync_event_sf);
+	if (sde_crtc->vsync_event_sf)
+		sysfs_notify_dirent(sde_crtc->vsync_event_sf);
 
 	drm_crtc_handle_vblank(crtc);
 	DRM_DEBUG_VBL("crtc%d\n", crtc->base.id);
@@ -3173,16 +3176,15 @@ static void _sde_crtc_set_input_fence_timeout(struct sde_crtc_state *cstate)
 	cstate->input_fence_timeout_ns *= NSEC_PER_MSEC;
 }
 
-/**
- * _sde_crtc_clear_dim_layers_v1 - clear all dim layer settings
- * @cstate:      Pointer to sde crtc state
- */
-static void _sde_crtc_clear_dim_layers_v1(struct sde_crtc_state *cstate)
+void _sde_crtc_clear_dim_layers_v1(struct drm_crtc_state *state)
 {
 	u32 i;
+	struct sde_crtc_state *cstate;
 
-	if (!cstate)
+	if (!state)
 		return;
+
+	cstate = to_sde_crtc_state(state);
 
 	for (i = 0; i < cstate->num_dim_layers; i++)
 		memset(&cstate->dim_layer[i], 0, sizeof(cstate->dim_layer[i]));
@@ -3219,7 +3221,7 @@ static void _sde_crtc_set_dim_layer_v1(struct drm_crtc *crtc,
 
 	if (!usr_ptr) {
 		/* usr_ptr is null when setting the default property value */
-		_sde_crtc_clear_dim_layers_v1(cstate);
+		_sde_crtc_clear_dim_layers_v1(&cstate->base);
 		SDE_DEBUG("dim_layer data removed\n");
 		return;
 	}
@@ -3844,6 +3846,9 @@ static void sde_crtc_atomic_begin(struct drm_crtc *crtc,
 		sde_encoder_trigger_kickoff_pending(encoder);
 	}
 
+	 /* update performance setting */
+		sde_core_perf_crtc_update(crtc, 1, false);
+
 	/*
 	 * If no mixers have been allocated in sde_crtc_atomic_check(),
 	 * it means we are trying to flush a CRTC whose state is disabled:
@@ -3862,8 +3867,8 @@ static void sde_crtc_atomic_begin(struct drm_crtc *crtc,
 	_sde_crtc_dest_scaler_setup(crtc);
 
 	/* cancel the idle notify delayed work */
-	if (sde_encoder_check_mode(sde_crtc->mixers[0].encoder,
-					MSM_DISPLAY_CAP_VID_MODE) &&
+	if (sde_encoder_check_curr_mode(sde_crtc->mixers[0].encoder,
+					MSM_DISPLAY_VIDEO_MODE) &&
 		kthread_cancel_delayed_work_sync(&sde_crtc->idle_notify_work))
 		SDE_DEBUG("idle notify work cancelled\n");
 
@@ -3971,8 +3976,8 @@ static void sde_crtc_atomic_flush(struct drm_crtc *crtc,
 	_sde_crtc_wait_for_fences(crtc);
 
 	/* schedule the idle notify delayed work */
-	if (idle_time && sde_encoder_check_mode(sde_crtc->mixers[0].encoder,
-						MSM_DISPLAY_CAP_VID_MODE)) {
+	if (sde_encoder_check_curr_mode(sde_crtc->mixers[0].encoder,
+				MSM_DISPLAY_VIDEO_MODE) && idle_time) {
 		kthread_queue_delayed_work(&event_thread->worker,
 					&sde_crtc->idle_notify_work,
 					msecs_to_jiffies(idle_time));
@@ -3989,9 +3994,6 @@ static void sde_crtc_atomic_flush(struct drm_crtc *crtc,
 		}
 		cstate->rsc_update = true;
 	}
-
-	/* update performance setting before crtc kickoff */
-	sde_core_perf_crtc_update(crtc, 1, false);
 
 	/*
 	 * Final plane updates: Give each plane a chance to complete all
@@ -4514,6 +4516,8 @@ void sde_crtc_commit_kickoff(struct drm_crtc *crtc,
 	if (cstate->sbuf_cfg.rot_op_mode != SDE_CTL_ROT_OP_MODE_INLINE_ASYNC)
 		if (_sde_crtc_commit_kickoff_rot(crtc, cstate))
 			is_error = true;
+
+	sde_vbif_clear_errors(sde_kms);
 
 	if (is_error) {
 		_sde_crtc_remove_pipe_flush(crtc);
@@ -5325,8 +5329,8 @@ static int _sde_crtc_check_secure_state(struct drm_crtc *crtc,
 		if (encoder->crtc != crtc)
 			continue;
 
-		is_video_mode |= sde_encoder_check_mode(encoder,
-						MSM_DISPLAY_CAP_VID_MODE);
+		is_video_mode |= sde_encoder_check_curr_mode(encoder,
+						MSM_DISPLAY_VIDEO_MODE);
 	}
 
 	sde_crtc = to_sde_crtc(crtc);
@@ -5366,7 +5370,7 @@ static int sde_crtc_atomic_check(struct drm_crtc *crtc,
 {
 	struct drm_device *dev;
 	struct sde_crtc *sde_crtc;
-	struct plane_state pstates[SDE_PSTATES_MAX];
+	struct plane_state *pstates = NULL;
 	struct sde_crtc_state *cstate;
 	struct sde_kms *kms;
 
@@ -5376,7 +5380,7 @@ static int sde_crtc_atomic_check(struct drm_crtc *crtc,
 
 	int cnt = 0, rc = 0, mixer_width, i, z_pos, mixer_height;
 
-	struct sde_multirect_plane_states multirect_plane[SDE_MULTIRECT_PLANE_MAX];
+	struct sde_multirect_plane_states *multirect_plane = NULL;
 	int multirect_count = 0;
 	const struct drm_plane_state *pipe_staged[SSPP_MAX];
 	int left_zpos_cnt = 0, right_zpos_cnt = 0;
@@ -5404,6 +5408,18 @@ static int sde_crtc_atomic_check(struct drm_crtc *crtc,
 	if (!state->enable || !state->active) {
 		SDE_DEBUG("crtc%d -> enable %d, active %d, skip atomic_check\n",
 				crtc->base.id, state->enable, state->active);
+		goto end;
+	}
+
+	pstates = kcalloc(SDE_PSTATES_MAX,
+			sizeof(struct plane_state), GFP_KERNEL);
+
+	multirect_plane = kcalloc(SDE_MULTIRECT_PLANE_MAX,
+			sizeof(struct sde_multirect_plane_states),
+			GFP_KERNEL);
+
+	if (!pstates || !multirect_plane) {
+		rc = -ENOMEM;
 		goto end;
 	}
 
@@ -5645,6 +5661,8 @@ static int sde_crtc_atomic_check(struct drm_crtc *crtc,
 	}
 
 end:
+	kfree(pstates);
+	kfree(multirect_plane);
 	_sde_crtc_rp_free_unused(&cstate->rp);
 	return rc;
 }
@@ -6021,8 +6039,6 @@ static int _sde_crtc_get_output_fence(struct drm_crtc *crtc,
 	uint32_t offset, i;
 	struct drm_connector_state *old_conn_state, *new_conn_state;
 	struct drm_connector *conn;
-	struct sde_connector *sde_conn = NULL;
-	struct msm_display_info disp_info;
 	bool is_vid = false;
 	struct drm_encoder *encoder;
 
@@ -6030,8 +6046,9 @@ static int _sde_crtc_get_output_fence(struct drm_crtc *crtc,
 	cstate = to_sde_crtc_state(state);
 
 	drm_for_each_encoder_mask(encoder, crtc->dev, state->encoder_mask) {
-		is_vid |= sde_encoder_check_mode(encoder,
-						MSM_DISPLAY_CAP_VID_MODE);
+		if (sde_encoder_check_curr_mode(encoder,
+			MSM_DISPLAY_VIDEO_MODE))
+			is_vid = true;
 		if (is_vid)
 			break;
 	}
@@ -6047,15 +6064,11 @@ static int _sde_crtc_get_output_fence(struct drm_crtc *crtc,
 			if (!new_conn_state || new_conn_state->crtc != crtc)
 				continue;
 
-			sde_conn = to_sde_connector(new_conn_state->connector);
-			if (sde_conn->display && sde_conn->ops.get_info) {
-				sde_conn->ops.get_info(conn, &disp_info,
-							sde_conn->display);
-				is_vid |= disp_info.capabilities &
-						MSM_DISPLAY_CAP_VID_MODE;
-				if (is_vid)
-					break;
-			}
+			if (sde_encoder_check_curr_mode(encoder,
+				MSM_DISPLAY_VIDEO_MODE))
+				is_vid = true;
+			if (is_vid)
+				break;
 		}
 	}
 

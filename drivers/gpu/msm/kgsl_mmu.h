@@ -1,4 +1,4 @@
-/* Copyright (c) 2002,2007-2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2002,2007-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -170,6 +170,8 @@ struct kgsl_mmu {
 	unsigned int secure_align_mask;
 	uint64_t va_padding;
 	unsigned int svm_base32;
+	unsigned int secure_base;
+	unsigned int secure_size;
 	union {
 		struct kgsl_iommu iommu;
 	} priv;
@@ -376,6 +378,19 @@ static inline struct kgsl_protected_registers *kgsl_mmu_get_prot_regs
 static inline int kgsl_mmu_is_perprocess(struct kgsl_mmu *mmu)
 {
 	return MMU_FEATURE(mmu, KGSL_MMU_GLOBAL_PAGETABLE) ? 0 : 1;
+}
+
+/*
+ * kgsl_mmu_is_perprocess_pt - Return true if the object is a
+ * per process pagetable
+ * @pt: A handle to the pagetable
+ *
+ * Return: True if the pagetable is per process pagetable
+ */
+static inline bool kgsl_mmu_is_perprocess_pt(struct kgsl_pagetable *pt)
+{
+	return (pt->name != KGSL_MMU_GLOBAL_PT &&
+			pt->name != KGSL_MMU_SECURE_PT);
 }
 
 static inline int kgsl_mmu_use_cpu_map(struct kgsl_mmu *mmu)

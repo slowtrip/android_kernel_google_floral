@@ -1,4 +1,5 @@
 /* Copyright (c) 2008-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -280,9 +281,9 @@ kgsl_mem_entry_create(void)
 		kref_init(&entry->refcount);
 		/* put this ref in userspace memory alloc and map ioctls */
 		kref_get(&entry->refcount);
+		atomic_set(&entry->map_count, 0);
 	}
 
-	atomic_set(&entry->map_count, 0);
 	return entry;
 }
 
@@ -319,6 +320,8 @@ static void add_dmabuf_list(struct kgsl_dma_buf_meta *meta)
 		list_add(&dle->node, &kgsl_dmabuf_list);
 		meta->dle = dle;
 		list_add(&meta->node, &dle->dmabuf_list);
+		kgsl_trace_gpu_mem_total(meta->device,
+				 meta->entry->memdesc.size);
 	}
 	spin_unlock(&kgsl_dmabuf_lock);
 }
@@ -335,13 +338,19 @@ static void remove_dmabuf_list(struct kgsl_dma_buf_meta *meta)
 	if (list_empty(&dle->dmabuf_list)) {
 		list_del(&dle->node);
 		kfree(dle);
+		kgsl_trace_gpu_mem_total(meta->device,
+				-(meta->entry->memdesc.size));
 	}
 	spin_unlock(&kgsl_dmabuf_lock);
 }
 
 #ifdef CONFIG_DMA_SHARED_BUFFER
-static void kgsl_destroy_ion(struct kgsl_dma_buf_meta *meta)
+static void kgsl_destroy_ion(struct kgsl_memdesc *memdesc)
 {
+	struct kgsl_mem_entry *entry = container_of(memdesc,
+				struct kgsl_mem_entry, memdesc);
+	struct kgsl_dma_buf_meta *meta = entry->priv_data;
+
 	if (meta != NULL) {
 		remove_dmabuf_list(meta);
 		dma_buf_unmap_attachment(meta->attach, meta->table,
@@ -350,13 +359,44 @@ static void kgsl_destroy_ion(struct kgsl_dma_buf_meta *meta)
 		dma_buf_put(meta->dmabuf);
 		kfree(meta);
 	}
-}
-#else
-static void kgsl_destroy_ion(struct kgsl_dma_buf_meta *meta)
-{
 
+	/*
+	 * Ion takes care of freeing the sg_table for us so
+	 * clear the sg table to ensure kgsl_sharedmem_free
+	 * doesn't try to free it again
+	 */
+	memdesc->sgt = NULL;
 }
+
+static struct kgsl_memdesc_ops kgsl_dmabuf_ops = {
+	.free = kgsl_destroy_ion,
+};
 #endif
+
+static void kgsl_destroy_anon(struct kgsl_memdesc *memdesc)
+{
+	int i = 0, j;
+	struct scatterlist *sg;
+	struct page *page;
+
+	for_each_sg(memdesc->sgt->sgl, sg, memdesc->sgt->nents, i) {
+		page = sg_page(sg);
+		for (j = 0; j < (sg->length >> PAGE_SHIFT); j++) {
+			/*
+			 * Mark the page in the scatterlist as dirty if they
+			 * were writable by the GPU.
+			 */
+			if (!(memdesc->flags & KGSL_MEMFLAGS_GPUREADONLY))
+				set_page_dirty_lock(nth_page(page, j));
+
+			/*
+			 * Put the page reference taken using get_user_pages
+			 * during memdesc_sg_virt.
+			 */
+			put_page(nth_page(page, j));
+		}
+	}
+}
 
 void
 kgsl_mem_entry_destroy(struct kref *kref)
@@ -383,40 +423,7 @@ kgsl_mem_entry_destroy(struct kref *kref)
 		atomic_long_sub(entry->memdesc.size,
 			&kgsl_driver.stats.mapped);
 
-	/*
-	 * Ion takes care of freeing the sg_table for us so
-	 * clear the sg table before freeing the sharedmem
-	 * so kgsl_sharedmem_free doesn't try to free it again
-	 */
-	if (memtype == KGSL_MEM_ENTRY_ION)
-		entry->memdesc.sgt = NULL;
-
-	if ((memtype == KGSL_MEM_ENTRY_USER)
-		&& !(entry->memdesc.flags & KGSL_MEMFLAGS_GPUREADONLY)) {
-		int i = 0, j;
-		struct scatterlist *sg;
-		struct page *page;
-		/*
-		 * Mark all of pages in the scatterlist as dirty since they
-		 * were writable by the GPU.
-		 */
-		for_each_sg(entry->memdesc.sgt->sgl, sg,
-			    entry->memdesc.sgt->nents, i) {
-			page = sg_page(sg);
-			for (j = 0; j < (sg->length >> PAGE_SHIFT); j++)
-				set_page_dirty_lock(nth_page(page, j));
-		}
-	}
-
 	kgsl_sharedmem_free(&entry->memdesc);
-
-	switch (memtype) {
-	case KGSL_MEM_ENTRY_ION:
-		kgsl_destroy_ion(entry->priv_data);
-		break;
-	default:
-		break;
-	}
 
 	kfree(entry);
 }
@@ -583,6 +590,21 @@ static int _kgsl_get_context_id(struct kgsl_device *device)
 	return id;
 }
 
+void kgsl_dump_active_contexts(struct kgsl_device *device)
+{
+	struct kgsl_context *tmp_context;
+	int tmp_id;
+
+	read_lock(&device->context_lock);
+	idr_for_each_entry (&device->context_idr, tmp_context, tmp_id) {
+		KGSL_DRV_ERR(device, "process %s pid %d created %d contexts",
+			     tmp_context->proc_priv->comm,
+			     tmp_context->proc_priv->pid,
+			     tmp_context->proc_priv->ctxt_count);
+	}
+	read_unlock(&device->context_lock);
+}
+
 /**
  * kgsl_context_init() - helper to initialize kgsl_context members
  * @dev_priv: the owner of the context
@@ -631,12 +653,14 @@ int kgsl_context_init(struct kgsl_device_private *dev_priv,
 		flush_workqueue(device->events_wq);
 		id = _kgsl_get_context_id(device);
 	}
-
 	if (id < 0) {
-		if (id == -ENOSPC)
-			KGSL_DRV_INFO(device,
+		if (id == -ENOSPC) {
+			KGSL_DRV_ERR(
+				device,
 				"cannot have more than %zu contexts due to memstore limitation\n",
 				KGSL_MEMSTORE_MAX);
+			kgsl_dump_active_contexts(device);
+		}
 		atomic_dec(&proc_priv->ctxt_count);
 		return id;
 	}
@@ -2103,7 +2127,7 @@ static long gpumem_free_entry_on_timestamp(struct kgsl_device *device,
 	kgsl_readtimestamp(device, context, KGSL_TIMESTAMP_RETIRED, &temp);
 	trace_kgsl_mem_timestamp_queue(device, entry, context->id, temp,
 		timestamp);
-	ret = kgsl_add_low_prio_event(device, &context->events,
+	ret = kgsl_add_event(device, &context->events,
 		timestamp, gpumem_free_func, entry);
 
 	if (ret)
@@ -2217,7 +2241,7 @@ static long gpuobj_free_on_fence(struct kgsl_device_private *dev_priv,
 	}
 
 	handle = kgsl_sync_fence_async_wait(event.fd,
-		gpuobj_free_fence_func, entry);
+		gpuobj_free_fence_func, entry, NULL);
 
 	if (IS_ERR(handle)) {
 		kgsl_mem_entry_unset_pend(entry);
@@ -2366,6 +2390,15 @@ static int memdesc_sg_virt(struct kgsl_memdesc *memdesc, unsigned long useraddr)
 
 	ret = sg_alloc_table_from_pages(memdesc->sgt, pages, npages,
 					0, memdesc->size, GFP_KERNEL);
+
+	if (ret)
+		goto out;
+
+	ret = kgsl_cache_range_op(memdesc, 0, memdesc->size,
+			KGSL_CACHE_OP_FLUSH);
+
+	if (ret)
+		sg_free_table(memdesc->sgt);
 out:
 	if (ret) {
 		for (i = 0; i < npages; i++)
@@ -2377,6 +2410,10 @@ out:
 	kgsl_free(pages);
 	return ret;
 }
+
+static struct kgsl_memdesc_ops kgsl_usermem_ops = {
+	.free = kgsl_destroy_anon,
+};
 
 static int kgsl_setup_anon_useraddr(struct kgsl_pagetable *pagetable,
 	struct kgsl_mem_entry *entry, unsigned long hostptr,
@@ -2392,6 +2429,7 @@ static int kgsl_setup_anon_useraddr(struct kgsl_pagetable *pagetable,
 	entry->memdesc.pagetable = pagetable;
 	entry->memdesc.size = (uint64_t) size;
 	entry->memdesc.flags |= (uint64_t)KGSL_MEMFLAGS_USERMEM_ADDR;
+	entry->memdesc.ops = &kgsl_usermem_ops;
 
 	if (kgsl_memdesc_use_cpu_map(&entry->memdesc)) {
 		/* Register the address in the database */
@@ -2690,11 +2728,6 @@ long kgsl_ioctl_gpuobj_import(struct kgsl_device_private *dev_priv,
 	return 0;
 
 unmap:
-	if (kgsl_memdesc_usermem_type(&entry->memdesc) == KGSL_MEM_ENTRY_ION) {
-		kgsl_destroy_ion(entry->priv_data);
-		entry->memdesc.sgt = NULL;
-	}
-
 	kgsl_sharedmem_free(&entry->memdesc);
 
 out:
@@ -2800,6 +2833,7 @@ static int kgsl_setup_dma_buf(struct kgsl_device *device,
 	entry->priv_data = meta;
 	entry->memdesc.pagetable = pagetable;
 	entry->memdesc.size = 0;
+	entry->memdesc.ops = &kgsl_dmabuf_ops;
 	/* USE_CPU_MAP is not impemented for ION. */
 	entry->memdesc.flags &= ~((uint64_t) KGSL_MEMFLAGS_USE_CPU_MAP);
 	entry->memdesc.flags |= (uint64_t)KGSL_MEMFLAGS_USERMEM_ION;
@@ -3005,14 +3039,6 @@ long kgsl_ioctl_map_user_mem(struct kgsl_device_private *dev_priv,
 	return result;
 
 error_attach:
-	switch (kgsl_memdesc_usermem_type(&entry->memdesc)) {
-	case KGSL_MEM_ENTRY_ION:
-		kgsl_destroy_ion(entry->priv_data);
-		entry->memdesc.sgt = NULL;
-		break;
-	default:
-		break;
-	}
 	kgsl_sharedmem_free(&entry->memdesc);
 error:
 	/* Clear gpuaddr here so userspace doesn't get any wrong ideas */
@@ -4946,6 +4972,7 @@ int kgsl_device_platform_probe(struct kgsl_device *device)
 {
 	int status = -EINVAL;
 	struct resource *res;
+	int cpu;
 
 	status = _register_device(device);
 	if (status)
@@ -5015,8 +5042,8 @@ int kgsl_device_platform_probe(struct kgsl_device *device)
 	}
 
 	status = devm_request_irq(device->dev, device->pwrctrl.interrupt_num,
-				  kgsl_irq_handler, IRQF_TRIGGER_HIGH |
-				  IRQF_PERF_AFFINE, device->name, device);
+				  kgsl_irq_handler, IRQF_TRIGGER_HIGH,
+				  device->name, device);
 	if (status) {
 		KGSL_DRV_ERR(device, "request_irq(%d) failed: %d\n",
 			      device->pwrctrl.interrupt_num, status);
@@ -5075,6 +5102,22 @@ int kgsl_device_platform_probe(struct kgsl_device *device)
 				PM_QOS_CPU_DMA_LATENCY,
 				PM_QOS_DEFAULT_VALUE);
 
+	if (device->pwrctrl.l2pc_cpus_mask) {
+		struct pm_qos_request *qos = &device->pwrctrl.l2pc_cpus_qos;
+
+		qos->type = PM_QOS_REQ_AFFINE_CORES;
+
+		cpumask_empty(&qos->cpus_affine);
+		for_each_possible_cpu(cpu) {
+			if ((1 << cpu) & device->pwrctrl.l2pc_cpus_mask)
+				cpumask_set_cpu(cpu, &qos->cpus_affine);
+		}
+
+		pm_qos_add_request(&device->pwrctrl.l2pc_cpus_qos,
+				PM_QOS_CPU_DMA_LATENCY,
+				PM_QOS_DEFAULT_VALUE);
+	}
+
 	device->events_wq = alloc_workqueue("kgsl-events",
 		WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS, 0);
 
@@ -5111,6 +5154,8 @@ void kgsl_device_platform_remove(struct kgsl_device *device)
 	kgsl_pwrctrl_uninit_sysfs(device);
 
 	pm_qos_remove_request(&device->pwrctrl.pm_qos_req_dma);
+	if (device->pwrctrl.l2pc_cpus_mask)
+		pm_qos_remove_request(&device->pwrctrl.l2pc_cpus_qos);
 
 	idr_destroy(&device->context_idr);
 
@@ -5152,23 +5197,10 @@ static void kgsl_core_exit(void)
 	unregister_chrdev_region(kgsl_driver.major, KGSL_DEVICE_MAX);
 }
 
-static long kgsl_run_one_worker(struct kthread_worker *worker,
-		struct task_struct **thread, const char *name)
-{
-	kthread_init_worker(worker);
-	*thread = kthread_run_perf_critical(cpu_perf_mask, kthread_worker_fn,
-					    worker, name);
-	if (IS_ERR(*thread)) {
-		pr_err("unable to start %s\n", name);
-		return PTR_ERR(thread);
-	}
-	return 0;
-}
-
 static int __init kgsl_core_init(void)
 {
 	int result = 0;
-	struct sched_param param = { .sched_priority = 16 };
+	struct sched_param param = { .sched_priority = 2 };
 
 	place_marker("M - DRIVER KGSL Init");
 
@@ -5238,16 +5270,17 @@ static int __init kgsl_core_init(void)
 	kgsl_driver.mem_workqueue = alloc_workqueue("kgsl-mementry",
 		WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
 
-	if (IS_ERR_VALUE(kgsl_run_one_worker(&kgsl_driver.worker,
-			&kgsl_driver.worker_thread,
-			"kgsl_worker_thread")) ||
-		IS_ERR_VALUE(kgsl_run_one_worker(&kgsl_driver.low_prio_worker,
-			&kgsl_driver.low_prio_worker_thread,
-			"kgsl_low_prio_worker_thread")))
+	kthread_init_worker(&kgsl_driver.worker);
+
+	kgsl_driver.worker_thread = kthread_run(kthread_worker_fn,
+		&kgsl_driver.worker, "kgsl_worker_thread");
+
+	if (IS_ERR(kgsl_driver.worker_thread)) {
+		pr_err("unable to start kgsl thread\n");
 		goto err;
+	}
 
 	sched_setscheduler(kgsl_driver.worker_thread, SCHED_FIFO, &param);
-	/* kgsl_driver.low_prio_worker_thread should not be SCHED_FIFO */
 
 	kgsl_events_init();
 

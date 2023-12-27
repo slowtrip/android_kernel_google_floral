@@ -1,4 +1,5 @@
 /* Copyright (c) 2002,2007-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -91,8 +92,6 @@ static void adreno_ringbuffer_wptr(struct adreno_device *adreno_dev,
 {
 	struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
 	unsigned long flags;
-	bool write = false;
-	unsigned int val;
 	int ret = 0;
 
 	spin_lock_irqsave(&rb->preempt_lock, flags);
@@ -105,9 +104,28 @@ static void adreno_ringbuffer_wptr(struct adreno_device *adreno_dev,
 			 */
 			kgsl_pwrscale_busy(KGSL_DEVICE(adreno_dev));
 
-			write = true;
-			val = rb->_wptr;
+			/*
+			 * There could be a situation where GPU comes out of
+			 * ifpc after a fenced write transaction but before
+			 * reading AHB_FENCE_STATUS from KMD, it goes back to
+			 * ifpc due to inactivity (kernel scheduler plays a
+			 * role here). Put a keep alive vote to avoid such
+			 * unlikely scenario.
+			 */
+			if (gpudev->gpu_keepalive)
+				gpudev->gpu_keepalive(adreno_dev, true);
+
+			/*
+			 * Ensure the write posted after a possible
+			 * GMU wakeup (write could have dropped during wakeup)
+			 */
+			ret = adreno_gmu_fenced_write(adreno_dev,
+				ADRENO_REG_CP_RB_WPTR, rb->_wptr,
+				FENCE_STATUS_WRITEDROPPED0_MASK);
 			rb->skip_inline_wptr = false;
+			if (gpudev->gpu_keepalive)
+				gpudev->gpu_keepalive(adreno_dev, false);
+
 		}
 	} else {
 		/*
@@ -121,29 +139,6 @@ static void adreno_ringbuffer_wptr(struct adreno_device *adreno_dev,
 
 	rb->wptr = rb->_wptr;
 	spin_unlock_irqrestore(&rb->preempt_lock, flags);
-
-	/*
-	 * Ensure the write posted after a possible GMU wakeup (write could have
-	 * dropped during wakeup)
-	 */
-	if (write) {
-		/*
-		 * There could be a situation where GPU comes out of ifpc after
-		 * a fenced write but before reading AHB_FENCE_STATUS from KMD,
-		 * it goes back to ifpc due to inactivity (kernel scheduler
-		 * plays a role here). Put a keep alive vote to avoid such an
-		 * unlikely scenario.
-		 */
-		if (gpudev->gpu_keepalive)
-			gpudev->gpu_keepalive(adreno_dev, true);
-
-		ret = adreno_gmu_fenced_write(adreno_dev, ADRENO_REG_CP_RB_WPTR,
-					      val,
-					      FENCE_STATUS_WRITEDROPPED0_MASK);
-
-		if (gpudev->gpu_keepalive)
-			gpudev->gpu_keepalive(adreno_dev, false);
-	}
 
 	if (ret) {
 		/* If WPTR update fails, set the fault and trigger recovery */
@@ -375,9 +370,9 @@ int adreno_ringbuffer_probe(struct adreno_device *adreno_dev, bool nopreempt)
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
+	unsigned int priv = KGSL_MEMDESC_RANDOM | KGSL_MEMDESC_PRIVILEGED;
 	int i, r = 0;
 	int status = -ENOMEM;
-	unsigned int priv = KGSL_MEMDESC_RANDOM | KGSL_MEMDESC_PRIVILEGED;
 
 	if (!adreno_is_a3xx(adreno_dev)) {
 		status = kgsl_allocate_global(device, &device->scratch,
@@ -598,7 +593,7 @@ adreno_ringbuffer_addcmds(struct adreno_ringbuffer *rb,
 
 	if (gpudev->preemption_pre_ibsubmit &&
 			adreno_is_preemption_enabled(adreno_dev))
-		total_sizedwords += 27;
+		total_sizedwords += 31;
 
 	if (gpudev->preemption_post_ibsubmit &&
 			adreno_is_preemption_enabled(adreno_dev))
@@ -822,7 +817,6 @@ adreno_ringbuffer_addcmds(struct adreno_ringbuffer *rb,
 				SCRATCH_RPTR_GPU_ADDR(device, rb->id));
 	}
 
-
 	/*
 	 * If we have more ringbuffer commands than space reserved
 	 * in ringbuffer BUG() to fix this because it will lead to
@@ -979,7 +973,6 @@ int adreno_ringbuffer_submitcmd(struct adreno_device *adreno_dev,
 	struct kgsl_memobj_node *ib;
 	unsigned int numibs = 0;
 	unsigned int *link;
-	unsigned int link_onstack[SZ_256] __aligned(sizeof(long));
 	unsigned int *cmds;
 	struct kgsl_context *context;
 	struct adreno_context *drawctxt;
@@ -1114,14 +1107,10 @@ int adreno_ringbuffer_submitcmd(struct adreno_device *adreno_dev,
 	if (gpudev->ccu_invalidate)
 		dwords += 4;
 
-	if (dwords <= ARRAY_SIZE(link_onstack)) {
-		link = link_onstack;
-	} else {
-		link = kcalloc(dwords, sizeof(unsigned int), GFP_KERNEL);
-		if (!link) {
-			ret = -ENOMEM;
-			goto done;
-		}
+	link = kcalloc(dwords, sizeof(unsigned int), GFP_KERNEL);
+	if (!link) {
+		ret = -ENOMEM;
+		goto done;
 	}
 
 	cmds = link;
@@ -1249,8 +1238,7 @@ done:
 	trace_kgsl_issueibcmds(device, context->id, numibs, drawobj->timestamp,
 			drawobj->flags, ret, drawctxt->type);
 
-	if (link != link_onstack)
-		kfree(link);
+	kfree(link);
 	return ret;
 }
 

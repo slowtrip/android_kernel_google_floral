@@ -34,6 +34,7 @@
 #define MAX_BL_SCALE_LEVEL 1024
 #define MAX_AD_BL_SCALE_LEVEL 65535
 #define DSI_CMD_PPS_SIZE 135
+#define BL_RANGE_MAX 10
 
 #define DSI_MODE_MAX 5
 #define HBM_RANGE_MAX 4
@@ -49,6 +50,7 @@ enum dsi_backlight_type {
 	DSI_BACKLIGHT_PWM = 0,
 	DSI_BACKLIGHT_WLED,
 	DSI_BACKLIGHT_DCS,
+	DSI_BACKLIGHT_EXTERNAL,
 	DSI_BACKLIGHT_UNKNOWN,
 	DSI_BACKLIGHT_MAX,
 };
@@ -98,6 +100,8 @@ struct dsi_dyn_clk_caps {
 	u32 *bit_clk_list;
 	u32 bit_clk_list_len;
 	bool skip_phy_timing_update;
+	enum dsi_dyn_clk_feature_type type;
+	bool maintain_const_fps;
 };
 
 struct dsi_pinctrl_info {
@@ -157,6 +161,22 @@ struct hbm_data {
 	struct workqueue_struct *dimming_workq;
 	struct work_struct dimming_work;
 	struct dsi_panel *panel;
+
+	/* IRC register address */
+	u8 irc_addr;
+	u32 irc_bit_offset;
+	u8 *irc_data;
+
+	/* Command to be sent to the panel to irc unlock */
+	struct dsi_panel_cmd_set irc_unlock_cmd;
+	/* Command to be sent to the panel to irc lock  */
+	struct dsi_panel_cmd_set irc_lock_cmd;
+};
+
+struct bl_notifier_data {
+	u32 ranges[BL_RANGE_MAX];
+	u32 num_ranges;
+	u32 cur_range;
 };
 
 struct dsi_backlight_config {
@@ -166,6 +186,7 @@ struct dsi_backlight_config {
 	u32 bl_min_level;
 	u32 bl_max_level;
 	u32 brightness_max_level;
+	u32 brightness_default_level;
 	u32 bl_scale;
 	u32 bl_scale_ad;
 	u32 bl_actual;
@@ -175,7 +196,9 @@ struct dsi_backlight_config {
 	bool allow_bl_update;
 	struct mutex state_lock;
 
+	struct bl_notifier_data *bl_notifier;
 	struct hbm_data *hbm;
+	bool bl_inverted_dbv;
 
 	int en_gpio;
 	struct backlight_device *bl_device;
@@ -274,6 +297,7 @@ struct dsi_panel {
 	struct dsi_video_engine_cfg video_config;
 	struct dsi_cmd_engine_cfg cmd_config;
 	enum dsi_op_mode panel_mode;
+	bool panel_mode_switch_enabled;
 
 	struct dsi_dfps_capabilities dfps_caps;
 	struct dsi_dyn_clk_caps dyn_clk_caps;
@@ -281,6 +305,7 @@ struct dsi_panel {
 
 	struct dsi_display_mode *cur_mode;
 	u32 num_timing_nodes;
+	u32 num_display_modes;
 
 	struct dsi_regulator_info power_info;
 	struct dsi_backlight_config bl_config;
@@ -453,6 +478,14 @@ int dsi_panel_send_qsync_off_dcs(struct dsi_panel *panel,
 int dsi_panel_send_roi_dcs(struct dsi_panel *panel, int ctrl_idx,
 		struct dsi_rect *roi);
 
+int dsi_panel_pre_mode_switch_to_video(struct dsi_panel *panel);
+
+int dsi_panel_pre_mode_switch_to_cmd(struct dsi_panel *panel);
+
+int dsi_panel_mode_switch_to_cmd(struct dsi_panel *panel);
+
+int dsi_panel_mode_switch_to_vid(struct dsi_panel *panel);
+
 int dsi_panel_switch(struct dsi_panel *panel);
 
 int dsi_panel_post_switch(struct dsi_panel *panel);
@@ -499,6 +532,8 @@ int dsi_panel_get_vendor_extinfo(struct dsi_panel *panel);
 /* Set/get high brightness mode */
 int dsi_panel_update_hbm(struct dsi_panel *panel, enum hbm_mode_type);
 enum hbm_mode_type dsi_panel_get_hbm(struct dsi_panel *panel);
+
+int dsi_panel_bl_update_irc(struct dsi_backlight_config *bl, bool enable);
 
 int dsi_panel_switch_init(struct dsi_panel *panel);
 void dsi_panel_switch_destroy(struct dsi_panel *panel);
